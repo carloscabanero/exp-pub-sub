@@ -1,5 +1,6 @@
 use cloud_pubsub::{error, Topic};
 use cloud_pubsub::{Client, EncodedMessage, FromPubSubMessage, Subscription};
+use serde::{Deserializer};
 use serde_derive::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use tracing::{debug, error, info};
 struct Config {
     topic: String,
     subscription: String,
-    google_application_credentials: String,
+    gcp_credentials: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,17 +31,21 @@ impl FromPubSubMessage for MachineStatsPacket {
     }
 }
 
-fn schedule_pubsub_pull(subscription: Arc<Subscription>) {
+// We need an Arc here as the Subscription/Client needs to continuously renew the token in the background. (!!)
+// All this complexity should have been hidden as part of whatever the subscription does with the client.
+// I guess we can wrap it.
+fn schedule_pubsub_pull<T: FromPubSubMessage + Send + 'static, F>(subscription: Arc<Subscription>, work: F) where F: Fn(T) + Send + 'static + Copy {
     task::spawn(async move {
         while subscription.client().is_running() {
-            match subscription.get_messages::<MachineStatsPacket>().await {
+            match subscription.get_messages::<T>().await {
                 Ok(messages) => {
                     for (result, ack_id) in messages {
                         match result {
                             Ok(message) => {
-                                info!("recieved {:?}", message);
+                                //info!("recieved {:?}", message);
                                 let subscription = Arc::clone(&subscription);
                                 task::spawn(async move {
+                                    work(message);
                                     subscription.acknowledge_messages(vec![ack_id]).await;
                                 });
                             }
@@ -88,7 +93,7 @@ async fn main() -> Result<(), error::Error> {
     }
     let config = parsed_env.unwrap();
 
-    let pubsub = match Client::new(config.google_application_credentials).await {
+    let pubsub = match Client::new(config.gcp_credentials).await {
         Err(e) => panic!("Failed to initialize pubsub: {}", e),
         Ok(mut client) => {
             if let Err(e) = client.refresh_token().await {
@@ -107,15 +112,31 @@ async fn main() -> Result<(), error::Error> {
 
     schedule_usage_metering(topic);
 
+    // TODO I would wrap in our own client, then the subscription or topics could be taken care of
+    // from a single place, by keeping track of who is contacting it.
+    // Then on close we would just wait for everything to wrap up.
     let subscription = pubsub.subscribe(config.subscription);
 
     debug!("Subscribed to topic with: {}", subscription.name);
     let sub = Arc::new(subscription);
-    schedule_pubsub_pull(sub.clone());
+    // TODO I would spin the task here instead of at the function
+    schedule_pubsub_pull(sub.clone(), |msg: MachineStatsPacket| {
+        println!("{}", msg.id);
+    });
+
     signal::ctrl_c().await?;
     debug!("Cleaning up");
+    // They are using variables to indicate the status.
+    // Stop is just changing the state the stopped. And then we are WAITING
+    // on a refernce to be zero to actually exit.
+    // With go you would wait on channels.
     pubsub.stop();
     debug!("Waiting for current Pull to finish....");
     while Arc::strong_count(&sub) > 1 {}
     Ok(())
 }
+
+// TODO Test method here to just add something to the queue.
+// TODO Test method to try the "message" itself.
+
+// The worker could be returned as part of a function, passing the "context" of DO or Redis to it.
