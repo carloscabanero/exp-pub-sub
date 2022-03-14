@@ -38,7 +38,7 @@ struct Worker<T> where
 // NOTE The Fn has a struct associated and we do not know the size when we send it, so it may require an
 // Arc or Box to store it.
     subscription: Arc<Subscription>,
-    work: Box<dyn Fn(T) + Send + Sync + 'static>,
+    work: Arc<dyn Fn(T) + Send + Sync + 'static>,
 }
 
 impl <T> Worker<T> where
@@ -50,7 +50,7 @@ impl <T> Worker<T> where
     {
         Worker {
             subscription: subscription,
-            work: Box::new(work)
+            work: Arc::new(work)
         }
     }
     // We could refactor to not store the function and just run it (maybe). Or use scoped threads.
@@ -65,10 +65,11 @@ impl <T> Worker<T> where
                                     //info!("recieved {:?}", message);
                                     let subscription = Arc::clone(&self.subscription);
                                     // T needs to be 'static just to help the compiler deal with it.
-                                    // Not an issue as it is moved.                                    
+                                    // Not an issue as it is moved.
+                                    let work = Arc::clone(&self.work);
                                     task::spawn(async move {
                                         println!("{:?}", message);
-                                        //self.work)(message);
+                                        work(message);
                                         subscription.acknowledge_messages(vec![ack_id]).await;
                                     });
                                 }
@@ -170,13 +171,18 @@ async fn main() -> Result<(), error::Error> {
     // from a single place, by keeping track of who is contacting it.
     // Then on close we would just wait for everything to wrap up.
     let subscription = pubsub.subscribe(config.subscription);
-
+    
     debug!("Subscribed to topic with: {}", subscription.name);
     let sub = Arc::new(subscription);
     // TODO I would spin the task here instead of at the function
-    schedule_pubsub_pull(sub.clone(), |msg: MachineStatsPacket| {
-        println!("{}", msg.id);
+    // schedule_pubsub_pull(sub.clone(), |msg: MachineStatsPacket| {
+    //     println!("{}", msg.id);
+    // });
+    let w = Worker::new(sub.clone(), |msg: MachineStatsPacket| {
+        println!("RECEIVED! {:?}", msg);
     });
+    
+    w.run();
 
     signal::ctrl_c().await?;
     debug!("Cleaning up");
