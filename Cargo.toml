@@ -10,7 +10,7 @@ edition = "2021"
 strip = true
 
 [dependencies]
-
+async-trait = "0.1.52"
 cloud-pubsub = "0.8.0"
 envy = "0.4"
 tokio =  { version = "1", features = ["macros", "signal"]}

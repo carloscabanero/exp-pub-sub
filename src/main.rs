@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use cloud_pubsub::{error, Topic};
 use cloud_pubsub::{Client, EncodedMessage, FromPubSubMessage, Subscription};
 use serde::{Deserializer};
@@ -12,6 +13,11 @@ struct Config {
     topic: String,
     subscription: String,
     gcp_credentials: String,
+}
+
+#[async_trait]
+trait Work {
+    async fn work(&self);
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,30 +37,41 @@ impl FromPubSubMessage for MachineStatsPacket {
     }
 }
 
+#[async_trait]
+impl Work for MachineStatsPacket {
+    async fn work(&self) {
+        println!("Working...");
+        let dur = Duration::from_secs(1);
+        let mut interval = time::interval(dur);
+        interval.tick().await;
+        println!("{:?}", self);
+    }
+}
+
 // https://stackoverflow.com/questions/41081240/idiomatic-callbacks-in-rust
-struct Worker<T> where
-    T: FromPubSubMessage + Send + 'static + std::fmt::Debug
+struct Worker
+//    T: Work + FromPubSubMessage //+ Send + 'static + std::fmt::Debug
 {
 // NOTE The Fn has a struct associated and we do not know the size when we send it, so it may require an
 // Arc or Box to store it.
     subscription: Arc<Subscription>,
-    work: Arc<dyn Fn(T) + Send + Sync + 'static>,
+//  work: Arc<dyn Fn(T) + Send + Sync + 'static>,
 }
 
-impl <T> Worker<T> where
-    T: FromPubSubMessage + Send + 'static + std::fmt::Debug
+impl Worker where 
 {
     // We may probably wrap the client ourselves too, so the "token" and stuff like that can be taken out.
     // Then the worker would just receive "work".
-    fn new(subscription: Arc<Subscription>, work: impl Fn(T) + Sync + Send + 'static) -> Self
+    fn new(subscription: Arc<Subscription>) -> Self
     {
         Worker {
             subscription: subscription,
-            work: Arc::new(work)
+//            work: Arc::new(work)
         }
     }
     // We could refactor to not store the function and just run it (maybe). Or use scoped threads.
-    fn run(self) {
+    fn run<T>(self) where
+        T: Work + FromPubSubMessage + Send + Sync + 'static {
         task::spawn(async move {
             while self.subscription.client().is_running() {
                 match self.subscription.get_messages::<T>().await {
@@ -66,10 +83,12 @@ impl <T> Worker<T> where
                                     let subscription = Arc::clone(&self.subscription);
                                     // T needs to be 'static just to help the compiler deal with it.
                                     // Not an issue as it is moved.
-                                    let work = Arc::clone(&self.work);
+                                    //let work = Arc::clone(&self.work);
+                                    println!("Received!");
                                     task::spawn(async move {
-                                        println!("{:?}", message);
-                                        work(message);
+                                        //println!("{:?}", message);
+                                        message.work().await;
+                                        //work(message);
                                         subscription.acknowledge_messages(vec![ack_id]).await;
                                     });
                                 }
@@ -116,11 +135,12 @@ fn schedule_pubsub_pull<T: FromPubSubMessage + Send + 'static, F>(subscription: 
 }
 
 fn schedule_usage_metering(topic: Topic) {
-    let dur = Duration::from_secs(40);
+    let dur = Duration::from_secs(2);
     let mut interval = time::interval(dur);
     task::spawn(async move {
         loop {
             interval.tick().await;
+            println!("Sending...");
             let p = MachineStatsPacket {
                 id: 1,
                 secs: dur.as_secs() as _,
@@ -178,11 +198,7 @@ async fn main() -> Result<(), error::Error> {
     // schedule_pubsub_pull(sub.clone(), |msg: MachineStatsPacket| {
     //     println!("{}", msg.id);
     // });
-    let w = Worker::new(sub.clone(), |msg: MachineStatsPacket| {
-        println!("RECEIVED! {:?}", msg);
-    });
-    
-    w.run();
+    Worker::new(sub.clone()).run::<MachineStatsPacket>();
 
     signal::ctrl_c().await?;
     debug!("Cleaning up");
