@@ -2,6 +2,8 @@ use cloud_pubsub::{error, Topic};
 use cloud_pubsub::{Client, EncodedMessage, FromPubSubMessage, Subscription};
 use serde::{Deserializer};
 use serde_derive::{Deserialize, Serialize};
+//use std::future::BoxFuture;
+use futures::future::BoxFuture;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::{signal, task, time};
@@ -38,7 +40,7 @@ struct Worker<T> where
 // NOTE The Fn has a struct associated and we do not know the size when we send it, so it may require an
 // Arc or Box to store it.
     subscription: Arc<Subscription>,
-    work: Arc<dyn Fn(T) + Send + Sync + 'static>,
+    work: Arc<dyn Fn(T) -> BoxFuture<'static, ()> + Send + Sync + 'static>,
 }
 
 impl <T> Worker<T> where
@@ -46,7 +48,7 @@ impl <T> Worker<T> where
 {
     // We may probably wrap the client ourselves too, so the "token" and stuff like that can be taken out.
     // Then the worker would just receive "work".
-    fn new(subscription: Arc<Subscription>, work: impl Fn(T) + Sync + Send + 'static) -> Self
+    fn new(subscription: Arc<Subscription>, work: impl Fn(T) -> BoxFuture<'static, ()>+ Sync + Send + 'static) -> Self
     {
         Worker {
             subscription: subscription,
@@ -69,7 +71,7 @@ impl <T> Worker<T> where
                                     let work = Arc::clone(&self.work);
                                     task::spawn(async move {
                                         println!("{:?}", message);
-                                        work(message);
+                                        work(message).await;
                                         subscription.acknowledge_messages(vec![ack_id]).await;
                                     });
                                 }
@@ -116,7 +118,7 @@ fn schedule_pubsub_pull<T: FromPubSubMessage + Send + 'static, F>(subscription: 
 }
 
 fn schedule_usage_metering(topic: Topic) {
-    let dur = Duration::from_secs(40);
+    let dur = Duration::from_secs(2);
     let mut interval = time::interval(dur);
     task::spawn(async move {
         loop {
@@ -178,8 +180,15 @@ async fn main() -> Result<(), error::Error> {
     // schedule_pubsub_pull(sub.clone(), |msg: MachineStatsPacket| {
     //     println!("{}", msg.id);
     // });
+
+    // I could not return a Future itself, because the size did not work. So how about boxing it...
+    // This is similar to what the async-trait does, but it allows us to call it here.
+    // https://stackoverflow.com/questions/58173711/how-can-i-store-an-async-function-in-a-struct-and-call-it-from-a-struct-instance
+    // https://www.reddit.com/r/rust/comments/fcgun1/reason_for_using_boxpin/
     let w = Worker::new(sub.clone(), |msg: MachineStatsPacket| {
-        println!("RECEIVED! {:?}", msg);
+        Box::pin(async move {            
+            println!("RECEIVED! {:?}", msg); 
+        })
     });
     
     w.run();
